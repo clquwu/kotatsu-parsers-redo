@@ -1,9 +1,5 @@
 package org.koitharu.kotatsu.parsers.site.all
 
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import org.jsoup.Jsoup
@@ -41,30 +37,25 @@ import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.parseSafe
 import org.koitharu.kotatsu.parsers.util.selectFirstOrThrow
-import org.koitharu.kotatsu.parsers.util.splitByWhitespace
 import org.koitharu.kotatsu.parsers.util.suspendlazy.suspendLazy
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
 import org.koitharu.kotatsu.parsers.util.toTitleCase
-import org.koitharu.kotatsu.parsers.util.urlEncoded
 import java.text.SimpleDateFormat
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.util.Base64
 import java.util.EnumSet
 import java.util.Locale
+import java.io.ByteArrayOutputStream
+import java.net.URLEncoder
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 import kotlin.math.min
-import kotlin.random.Random
 
 private const val PIECE_SIZE = 200
 private const val MIN_SPLIT_COUNT = 5
-private const val VRF_RETRY_ATTEMPTS = 4 // Total attempts (1 initial + 3 retries)
-private const val VRF_INITIAL_DELAY_MS = 1500L // Start with a longer delay
-private const val VRF_MAX_DELAY_MS = 8000L // Cap the delay to 8 seconds
-private const val VRF_BACKOFF_FACTOR = 2.0
 
 @Suppress("CustomX509TrustManager")
 internal abstract class MangaFireParser(
@@ -73,18 +64,17 @@ internal abstract class MangaFireParser(
     private val siteLang: String,
 ) : PagedMangaParser(context, source, 30), Interceptor, MangaParserAuthProvider {
 
-    // VRF cache removed - each request gets its own unique token to prevent 403 errors
-    private val vrfValidityMs = 12 * 60 * 60 * 1000L // 12 hours
-
     private val client: WebClient by lazy {
         val newHttpClient = context.httpClient.newBuilder()
             .sslSocketFactory(SSLUtils.sslSocketFactory!!, SSLUtils.trustManager)
             .hostnameVerifier { _, _ -> true }
             .addInterceptor { chain ->
                 val request = chain.request()
-                val response = chain.proceed(request.newBuilder()
-                    .addHeader("Referer", "https://$domain/")
-                    .build())
+                val response = chain.proceed(
+                    request.newBuilder()
+                        .addHeader("Referer", "https://$domain/")
+                        .build()
+                )
 
                 if (request.url.fragment?.startsWith("scrambled") == true) {
                     return@addInterceptor context.redrawImageResponse(response) { bitmap ->
@@ -130,65 +120,6 @@ internal abstract class MangaFireParser(
             }
             .build()
         OkHttpWebClient(newHttpClient, source)
-    }
-
-    private val vrfParamRegex = Regex("[?&]vrf=([^&]+)")
-
-    // Result holder for retry helpers (kept private to this parser)
-    private data class RetryOutcome<T>(
-        val value: T?,
-        val error: Throwable?,
-    )
-
-    // New backoff-based retry (kept private to avoid exposing private type)
-    private suspend fun <T> retryWithBackoff(
-        attempts: Int = VRF_RETRY_ATTEMPTS,
-        initialDelayMs: Long = VRF_INITIAL_DELAY_MS,
-        maxDelayMs: Long = VRF_MAX_DELAY_MS,
-        backoffFactor: Double = VRF_BACKOFF_FACTOR,
-        block: suspend (attempt: Int) -> T?,
-    ): RetryOutcome<T> {
-        var lastError: Throwable? = null
-        var currentDelay = initialDelayMs
-
-        for (attempt in 1..attempts) {
-            try {
-                val result = block(attempt)
-                if (result != null) {
-                    return RetryOutcome(result, null)
-                }
-            } catch (e: Throwable) {
-                lastError = e
-            }
-
-            if (attempt == attempts) break
-            val jitter = (currentDelay * 0.25 * Random.nextDouble()).toLong()
-            val effectiveDelay = currentDelay + jitter
-            delay(effectiveDelay)
-            currentDelay = (currentDelay * backoffFactor).toLong().coerceAtMost(maxDelayMs)
-        }
-        return RetryOutcome(null, lastError)
-    }
-
-    // Compatibility wrapper for existing call sites; uses the new retryWithBackoff under the hood.
-    private suspend fun <T> retryUntilNotNull(
-        attempts: Int = VRF_RETRY_ATTEMPTS,
-        delayMs: Long = VRF_INITIAL_DELAY_MS,
-        maxDelayMs: Long = VRF_MAX_DELAY_MS,
-        backoffFactor: Double = VRF_BACKOFF_FACTOR,
-        block: suspend (attempt: Int) -> T?,
-    ): RetryOutcome<T> = retryWithBackoff(
-        attempts = attempts,
-        initialDelayMs = delayMs,
-        maxDelayMs = maxDelayMs,
-        backoffFactor = backoffFactor,
-        block = block,
-    )
-
-    private fun extractVrfFromUrls(urls: List<String>): String? {
-        return urls.firstNotNullOfOrNull { url ->
-            vrfParamRegex.find(url)?.groupValues?.getOrNull(1)
-        }
     }
 
     override val configKeyDomain: ConfigKey.Domain = ConfigKey.Domain("mangafire.to")
@@ -251,286 +182,6 @@ internal abstract class MangaFireParser(
         ),
     )
 
-    /**
-     * Extract VRF token for chapter listings from a chapter page (where VRF is actually generated)
-     * Pattern: /ajax/read/{mangaId}/{type}/{lang}?vrf=xxx
-     */
-    private suspend fun extractChapterListVrf(mangaId: String, type: String, langCode: String): String {
-        // Try most common chapter options first for faster loading
-        val chapterOptions = listOf("1", "0", "2") // Optimized: try only most common numbers first
-
-        val mangaIdPart = mangaId.substringAfterLast('.')
-
-        val primaryPattern = Regex("/ajax/read/$mangaIdPart/$type/$langCode\\?vrf=([^&]+)")
-        val fallbackPattern = Regex("/ajax/read/[^/]+/$type/$langCode\\?vrf=([^&]+)")
-        var lastError: Throwable? = null
-
-        for (chapterNum in chapterOptions) {
-            val chapterUrl = "https://$domain/read/$mangaId/$langCode/$type-$chapterNum"
-
-            val primaryOutcome = retryUntilNotNull {
-                val vrfUrls = context.captureWebViewUrls(
-                    pageUrl = chapterUrl,
-                    urlPattern = primaryPattern,
-                    timeout = 2000L,
-                )
-                extractVrfFromUrls(vrfUrls)
-            }
-            primaryOutcome.value?.let { return it }
-            lastError = primaryOutcome.error ?: lastError
-
-            val fallbackOutcome = retryUntilNotNull {
-                val fallbackUrls = context.captureWebViewUrls(
-                    pageUrl = chapterUrl,
-                    urlPattern = fallbackPattern,
-                    timeout = 1000L,
-                )
-                extractVrfFromUrls(fallbackUrls)
-            }
-            fallbackOutcome.value?.let { return it }
-            lastError = fallbackOutcome.error ?: lastError
-        }
-
-        val message = "Unable to extract chapter list VRF for $mangaId/$type/$langCode from chapter pages"
-        lastError?.let { throw Exception(message, it) }
-        throw Exception(message)
-    }
-
-    /**
-     * Extract VRF token for individual chapter images from the actual chapter page
-     * Pattern: /ajax/read/chapter/{chapterId}?vrf=xxx
-     */
-    private suspend fun extractChapterImagesVrf(chapterId: String, mangaId: String, type: String, langCode: String, chapterNumber: Float): String {
-        val chapterNumberStr = if (chapterNumber == chapterNumber.toInt().toFloat()) {
-            chapterNumber.toInt().toString()
-        } else {
-            chapterNumber.toString()
-        }
-        val chapterUrl = "https://$domain/read/$mangaId/$langCode/$type-$chapterNumberStr"
-
-        val primaryPattern = Regex("/ajax/read/chapter/$chapterId\\?vrf=([^&]+)")
-        val fallbackPattern = Regex("/ajax/read/chapter/\\d+\\?vrf=([^&]+)")
-        var lastError: Throwable? = null
-
-        val primaryOutcome = retryUntilNotNull {
-            val vrfUrls = context.captureWebViewUrls(
-                pageUrl = chapterUrl,
-                urlPattern = primaryPattern,
-                timeout = 2000L,
-            )
-            extractVrfFromUrls(vrfUrls)
-        }
-        primaryOutcome.value?.let { return it }
-        lastError = primaryOutcome.error ?: lastError
-
-        val fallbackOutcome = retryUntilNotNull {
-            val fallbackUrls = context.captureWebViewUrls(
-                pageUrl = chapterUrl,
-                urlPattern = fallbackPattern,
-                timeout = 1000L,
-            )
-            extractVrfFromUrls(fallbackUrls)
-        }
-        fallbackOutcome.value?.let { return it }
-        lastError = fallbackOutcome.error ?: lastError
-
-        val message = "Unable to extract chapter images VRF for chapter $chapterId from chapter page: https://$domain/read/$mangaId/$langCode/$type-$chapterNumberStr"
-        lastError?.let { throw Exception(message, it) }
-        throw Exception(message)
-    }
-
-    /**
-     * Extract VRF token for search from the main page using webview injection
-     * Pattern: /ajax/manga/search?keyword=xxx&vrf=xxx
-     */
-    private suspend fun extractSearchVrf(keyword: String): String {
-        val kw = keyword.replace("'", "\\'")
-        var lastError: Throwable? = null
-
-        val primaryOutcome = retryUntilNotNull<String>(
-            attempts = 3,
-            delayMs = 1000L
-        ) {
-            val pageJs = """
-            (function(){
-              console.log('[MF_VRF] PageScript started for keyword: ${kw}');
-              const kw='${kw}';
-              function trigger(){
-                const input=document.querySelector('.search-inner input[name=keyword]');
-                const form=document.querySelector('.search-inner form');
-                const hiddenVrf = document.querySelector('.search-inner input[name=vrf]');
-                console.log('[MF_VRF] Elements found:', {input: !!input, form: !!form, hiddenVrf: !!hiddenVrf});
-                if(!input){
-                  console.log('[MF_VRF] Search input not found');
-                  return false;
-                }
-                console.log('[MF_VRF] Setting keyword and triggering search:', kw);
-                input.value=kw;
-                input.focus();
-                input.dispatchEvent(new Event('input',{bubbles:true}));
-                input.dispatchEvent(new Event('change',{bubbles:true}));
-                input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));
-                setTimeout(()=>{
-                  try{
-                    if (hiddenVrf) console.log('[MF_VRF] Hidden VRF value:', hiddenVrf.value);
-                    if (form) {
-                      console.log('[MF_VRF] Submitting form');
-                      form.submit();
-                    } else {
-                      console.log('[MF_VRF] No form to submit');
-                    }
-                  }catch(e){
-                    console.log('[MF_VRF] Form submit error:', e);
-                  }
-                },300);
-                return true;
-              }
-              if(!trigger()){
-                console.log('[MF_VRF] Initial trigger failed, retrying...');
-                const t=setInterval(()=>{
-                  if(trigger()){
-                    console.log('[MF_VRF] Retry successful');
-                    clearInterval(t);
-                  }
-                },150);
-                setTimeout(()=>{
-                  console.log('[MF_VRF] Giving up after 5 seconds');
-                  clearInterval(t);
-                },5000);
-              } else {
-                console.log('[MF_VRF] Initial trigger successful');
-              }
-            })();
-            """.trimIndent()
-
-            val filterJs = """
-            return url.includes('vrf=');
-            """.trimIndent()
-
-            val config = org.koitharu.kotatsu.parsers.webview.InterceptionConfig(
-                timeoutMs = 15000L,          // reasonable timeout, but will stop immediately when VRF found
-                pageScript = pageJs,         // this injects and executes in the WebView
-                filterScript = filterJs,     // this is only the predicate
-                maxRequests = 1              // Stop after finding the first VRF match!
-            )
-
-            val intercepted = context.interceptWebViewRequests(
-                url = "https://${domain}/",
-                config = config
-            )
-
-            // Extract VRF from filter page URL and validate it's the right pattern
-            intercepted.firstNotNullOfOrNull { request ->
-                val url = request.url
-                println("[MF_VRF] Checking captured URL: $url")
-
-                if (url.contains("/filter") && url.contains("keyword=") && url.contains("vrf=")) {
-                    println("[MF_VRF] Found matching filter URL: $url")
-                    val vrf = request.getQueryParameter("vrf")
-                    if (vrf?.isNotBlank() == true) {
-                        println("[MF_VRF] Extracted VRF: $vrf")
-                        // Validate we can construct the search AJAX URL
-                        val searchUrl = "https://${domain}/ajax/manga/search?keyword=${kw.urlEncoded()}&vrf=$vrf"
-                        println("[MF_VRF] Will use AJAX URL: $searchUrl")
-                        vrf
-                    } else {
-                        println("[MF_VRF] VRF is blank or null")
-                        null
-                    }
-                } else {
-                    println("[MF_VRF] URL doesn't match filter pattern: $url")
-                    null
-                }
-            }
-        }
-
-        primaryOutcome.value?.let { return it }
-        lastError = primaryOutcome.error ?: lastError
-
-        val message = "Unable to extract search VRF for keyword: $keyword from page: https://$domain/"
-        lastError?.let { throw Exception(message, it) }
-        throw Exception(message)
-    }
-
-    /**
-     * Extract VRF token for individual volume images from the actual volume page
-     * Pattern: /ajax/read/volume/{volumeId}?vrf=xxx
-     */
-    private suspend fun extractVolumeImagesVrf(volumeId: String, mangaId: String, type: String, langCode: String, volumeNumber: Float): String {
-        val volumeNumberStr = if (volumeNumber == volumeNumber.toInt().toFloat()) {
-            volumeNumber.toInt().toString()
-        } else {
-            volumeNumber.toString()
-        }
-        val volumeUrl = "https://$domain/read/$mangaId/$langCode/$type-$volumeNumberStr"
-
-        val primaryPattern = Regex("/ajax/read/volume/$volumeId\\?vrf=([^&]+)")
-        val fallbackPattern = Regex("/ajax/read/volume/\\d+\\?vrf=([^&]+)")
-        var lastError: Throwable? = null
-
-        val primaryOutcome = retryUntilNotNull {
-            val vrfUrls = context.captureWebViewUrls(
-                pageUrl = volumeUrl,
-                urlPattern = primaryPattern,
-                timeout = 2000L,
-            )
-            extractVrfFromUrls(vrfUrls)
-        }
-        primaryOutcome.value?.let { return it }
-        lastError = primaryOutcome.error ?: lastError
-
-        val fallbackOutcome = retryUntilNotNull {
-            val fallbackUrls = context.captureWebViewUrls(
-                pageUrl = volumeUrl,
-                urlPattern = fallbackPattern,
-                timeout = 1000L,
-            )
-            extractVrfFromUrls(fallbackUrls)
-        }
-        fallbackOutcome.value?.let { return it }
-        lastError = fallbackOutcome.error ?: lastError
-
-        val message = "Unable to extract volume images VRF for volume $volumeId from volume page: https://$domain/read/$mangaId/$langCode/$type-$volumeNumberStr"
-        lastError?.let { throw Exception(message, it) }
-        throw Exception(message)
-    }
-
-    /**
-     * Extract VRF token based on operation type
-     * Routes to appropriate specific VRF extraction method
-     */
-    private suspend fun extractVrfToken(
-        operation: String,
-        mangaId: String? = null,
-        type: String? = null,
-        langCode: String? = null,
-        chapterId: String? = null,
-        volumeId: String? = null,
-        number: Float? = null
-    ): String {
-        return when (operation) {
-            "chapter_list" -> {
-                require(mangaId != null && type != null && langCode != null) {
-                    "mangaId, type, and langCode are required for chapter_list operation"
-                }
-                val vrf = extractChapterListVrf(mangaId, type, langCode)
-                vrf
-            }
-            "chapter_images" -> {
-                throw IllegalStateException("chapter_images VRF should be extracted directly via extractChapterImagesVrf(), not through extractVrfToken()")
-            }
-            "volume_images" -> {
-                throw IllegalStateException("volume_images VRF should be extracted directly via extractVolumeImagesVrf(), not through extractVrfToken()")
-            }
-            "search" -> {
-                throw IllegalStateException("search VRF should be extracted directly via extractSearchVrf(), not through extractVrfToken()")
-            }
-            else -> {
-                throw IllegalArgumentException("Unknown VRF operation: $operation")
-            }
-        }
-    }
-
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         val url = "https://$domain/filter".toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
@@ -538,23 +189,24 @@ internal abstract class MangaFireParser(
 
             when {
                 !filter.query.isNullOrEmpty() -> {
-                    // Search functionality - extract VRF from filter page navigation
-                    val searchVrf = extractSearchVrf(filter.query)
+                    val keyword = encodeKeyword(filter.query)
+                    addEncodedQueryParameter("keyword", keyword)
 
-                    // Use the extracted VRF to make the actual AJAX search request
-                    val searchResponse = client.httpGet(
-                        "https://$domain/ajax/manga/search?keyword=${filter.query.urlEncoded()}&vrf=$searchVrf"
-                    ).parseJson()
+                    val searchVrf = VrfGenerator.generate(keyword)
+                    addQueryParameter("vrf", searchVrf)
 
-                    // Parse search results from JSON response
-                    val resultObj = searchResponse.getJSONObject("result")
-                    val htmlContent = resultObj.getString("html")
-                    println("[MF_VRF] Search result count: ${resultObj.getInt("count")}")
-                    println("[MF_VRF] Processing search results HTML...")
-
-                    return htmlContent
-                        .let(Jsoup::parseBodyFragment)
-                        .parseSearchResults()
+                    addQueryParameter(
+                        name = "sort",
+                        value = when (order) {
+                            SortOrder.UPDATED -> "recently_updated"
+                            SortOrder.POPULARITY -> "most_viewed"
+                            SortOrder.RATING -> "scores"
+                            SortOrder.NEWEST -> "release_date"
+                            SortOrder.ALPHABETICAL -> "title_az"
+                            SortOrder.RELEVANCE -> "most_relevance"
+                            else -> ""
+                        },
+                    )
                 }
 
                 else -> {
@@ -584,8 +236,8 @@ internal abstract class MangaFireParser(
                         name = "sort",
                         value = when (order) {
                             SortOrder.UPDATED -> "recently_updated"
-                            SortOrder.POPULARITY -> "total_views"
-                            SortOrder.RATING -> "mal_score"
+                            SortOrder.POPULARITY -> "most_viewed"
+                            SortOrder.RATING -> "scores"
                             SortOrder.NEWEST -> "release_date"
                             SortOrder.ALPHABETICAL -> "title_az"
                             SortOrder.RELEVANCE -> "most_relevance"
@@ -610,32 +262,6 @@ internal abstract class MangaFireParser(
                 publicUrl = mangaUrl.toAbsoluteUrl(domain),
                 title = a.ownText(),
                 coverUrl = it.selectFirstOrThrow("img").attrAsAbsoluteUrl("src"),
-                source = source,
-                altTitles = emptySet(),
-                largeCoverUrl = null,
-                authors = emptySet(),
-                contentRating = null,
-                rating = RATING_UNKNOWN,
-                state = null,
-                tags = emptySet(),
-            )
-        }
-    }
-
-    private fun Document.parseSearchResults(): List<Manga> {
-        return select(".original.card-sm.body a.unit").map { a ->
-            val mangaUrl = a.attrAsRelativeUrl("href")
-            val title = a.selectFirstOrThrow(".info > h6").ownText()
-            val coverUrl = a.selectFirstOrThrow(".poster img").attr("src").replace("@100", "")
-
-            println("[MF_VRF] Parsing search result: title='$title' url='$mangaUrl' cover='$coverUrl'")
-
-            Manga(
-                id = generateUid(mangaUrl),
-                url = mangaUrl,
-                publicUrl = mangaUrl.toAbsoluteUrl(domain),
-                title = title,
-                coverUrl = coverUrl,
                 source = source,
                 altTitles = emptySet(),
                 largeCoverUrl = null,
@@ -717,31 +343,20 @@ internal abstract class MangaFireParser(
             it.langCode == siteLang && availableTypes.contains(it.type)
         }
 
-        // Extract full manga identifier from URL (e.g., "kkochi-samkin-jimseung.kx976" from "/manga/kkochi-samkin-jimseung.kx976")
-        val fullMangaId = mangaUrl.substringAfterLast('/')
+        val id = mangaUrl.substringAfterLast('.')
 
-        return coroutineScope {
-            langTypePairs.map {
-                async {
-                    getChaptersBranch(fullMangaId, it)
-                }
-            }.awaitAll().flatten()
+        // FIXED: Use flatMap for sequential execution to avoid TooManyRequests exceptions
+        return langTypePairs.flatMap {
+            getChaptersBranch(id, it)
         }
     }
 
     private suspend fun getChaptersBranch(mangaId: String, branch: ChapterBranch): List<MangaChapter> {
-        val readVrf = extractVrfToken(
-            operation = "chapter_list",
-            mangaId = mangaId,
-            type = branch.type,
-            langCode = branch.langCode
-        )
-
-        // Use just the ID part for AJAX requests (same as the intercepted URL pattern)
-        val mangaIdPart = mangaId.substringAfterLast('.')
+        val readVrfInput = "$mangaId@${branch.type}@${branch.langCode}"
+        val readVrf = VrfGenerator.generate(readVrfInput)
 
         val response = client
-            .httpGet("https://$domain/ajax/read/$mangaIdPart/${branch.type}/${branch.langCode}?vrf=$readVrf")
+            .httpGet("https://$domain/ajax/read/$mangaId/${branch.type}/${branch.langCode}?vrf=$readVrf")
 
         val chapterElements = response.parseJson()
             .getJSONObject("result")
@@ -749,9 +364,9 @@ internal abstract class MangaFireParser(
             .let(Jsoup::parseBodyFragment)
             .select("ul li a")
 
-        if (branch.type == "chapter" || branch.type == "volume") {
+        if (branch.type == "chapter") {
             val doc = client
-                .httpGet("https://$domain/ajax/manga/$mangaIdPart/${branch.type}/${branch.langCode}")
+                .httpGet("https://$domain/ajax/manga/$mangaId/${branch.type}/${branch.langCode}")
                 .parseJson()
                 .getString("result")
                 .let(Jsoup::parseBodyFragment)
@@ -786,18 +401,15 @@ internal abstract class MangaFireParser(
     private val dateFormat = SimpleDateFormat("MMM dd, yyyy", Locale.ENGLISH)
     private val volumeNumRegex = Regex("""vol(ume)?\s*(\d+)""", RegexOption.IGNORE_CASE)
 
-    override suspend fun getRelatedManga(seed: Manga): List<Manga> = coroutineScope {
+    override suspend fun getRelatedManga(seed: Manga): List<Manga> {
         val document = client.httpGet(seed.url.toAbsoluteUrl(domain)).parseHtml()
-        val total = document.select(
-            "section.m-related a[href*=/manga/], .side-manga:not(:has(.head:contains(trending))) .unit",
-        ).size
-        val mangas = ArrayList<Manga>(total)
+        
+        // FIXED: Sequential processing instead of async/awaitAll
+        val mangas = document.select("section.m-related a[href*=/manga/]").mapNotNull {
+            val url = it.attrAsRelativeUrl("href")
 
-        // "Related Manga"
-        document.select("section.m-related a[href*=/manga/]").map {
-            async {
-                val url = it.attrAsRelativeUrl("href")
-
+            // Try-catch block to ensure one failure doesn't crash the whole related list
+            try {
                 val mangaDocument = client
                     .httpGet(url.toAbsoluteUrl(domain))
                     .parseHtml()
@@ -807,7 +419,7 @@ internal abstract class MangaFireParser(
 
 
                 if (!chaptersInManga.contains(siteLang)) {
-                    return@async null
+                    return@mapNotNull null
                 }
 
                 Manga(
@@ -826,9 +438,10 @@ internal abstract class MangaFireParser(
                     state = null,
                     tags = emptySet(),
                 )
+            } catch (e: Exception) {
+                null
             }
-        }.awaitAll()
-            .filterNotNullTo(mangas)
+        }.toMutableList()
 
         // "You may also like"
         document.select(".side-manga:not(:has(.head:contains(trending))) .unit").forEach {
@@ -852,58 +465,34 @@ internal abstract class MangaFireParser(
             )
         }
 
-        mangas.ifEmpty {
+        if (mangas.isEmpty()) {
             // fallback: author's other works
-            document.select("div.meta a[href*=/author/]").map {
-                async {
-                    val url = it.attrAsAbsoluteUrl("href").toHttpUrl()
-                        .newBuilder()
-                        .addQueryParameter("language[]", siteLang)
-                        .build()
+            // FIXED: Sequential processing using flatMap
+            val authorMangas = document.select("div.meta a[href*=/author/]").flatMap {
+                val url = it.attrAsAbsoluteUrl("href").toHttpUrl()
+                    .newBuilder()
+                    .addQueryParameter("language[]", siteLang)
+                    .build()
 
-                    client.httpGet(url)
-                        .parseHtml().parseMangaList()
-                }
-            }.awaitAll().flatten()
+                client.httpGet(url)
+                    .parseHtml().parseMangaList()
+            }
+            mangas.addAll(authorMangas)
         }
+
+        return mangas
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val itemId = chapter.url.substringAfterLast('/')
-        // Extract mangaId from chapter URL pattern: mangaId/type/lang/itemId (itemId = chapterId or volumeId)
-        val urlParts = chapter.url.split('/')
-        require(urlParts.size >= 4) { "Invalid chapter URL format: ${chapter.url}" }
+        // Url format: mangaId/type/lang/chapterId
+        val parts = chapter.url.split('/')
+        val type = parts[1] // "chapter" or "volume"
+        val chapterId = parts[3]
 
-        val mangaId = urlParts[0]
-        val type = urlParts[1]
-        val langCode = urlParts[2]
-
-        val (vrf, endpoint) = when (type) {
-            "chapter" -> {
-                val vrf = extractChapterImagesVrf(
-                    chapterId = itemId,
-                    mangaId = mangaId,
-                    type = type,
-                    langCode = langCode,
-                    chapterNumber = chapter.number
-                )
-                vrf to "chapter"
-            }
-            "volume" -> {
-                val vrf = extractVolumeImagesVrf(
-                    volumeId = itemId,
-                    mangaId = mangaId,
-                    type = type,
-                    langCode = langCode,
-                    volumeNumber = chapter.number
-                )
-                vrf to "volume"
-            }
-            else -> throw IllegalArgumentException("Unknown content type: $type")
-        }
+        val vrf = VrfGenerator.generate("$type@$chapterId")
 
         val images = client
-            .httpGet("https://$domain/ajax/read/$endpoint/$itemId?vrf=$vrf")
+            .httpGet("https://$domain/ajax/read/$type/$chapterId?vrf=$vrf")
             .parseJson()
             .getJSONObject("result")
             .getJSONArray("images")
@@ -935,6 +524,21 @@ internal abstract class MangaFireParser(
 
     private fun Int.ceilDiv(other: Int) = (this + (other - 1)) / other
 
+    //	Util / Helper
+    private fun encodeKeyword(input: String): String {
+        val sb = StringBuilder()
+        // Separate each word, even whitespace
+        for (c in input) {
+            when {
+                c == ' ' -> sb.append('+')
+                c.isLetterOrDigit() || c.code > 0x7F -> sb.append(c)
+                else -> sb.append(String.format("%%%02X", c.code))
+            }
+        }
+        // Tested with "mẹ mày béo @@+" keyword
+        return sb.toString()
+    }
+
     @MangaSourceParser("MANGAFIRE_EN", "MangaFire English", "en")
     class English(context: MangaLoaderContext) : MangaFireParser(context, MangaParserSource.MANGAFIRE_EN, "en")
 
@@ -957,6 +561,133 @@ internal abstract class MangaFireParser(
     @MangaSourceParser("MANGAFIRE_PTBR", "MangaFire Portuguese (Brazil)", "pt")
     class PortugueseBR(context: MangaLoaderContext) :
         MangaFireParser(context, MangaParserSource.MANGAFIRE_PTBR, "pt-br")
+}
+
+private object VrfGenerator {
+    private val rc4Keys = mapOf(
+        "l" to "FgxyJUQDPUGSzwbAq/ToWn4/e8jYzvabE+dLMb1XU1o=",
+        "g" to "CQx3CLwswJAnM1VxOqX+y+f3eUns03ulxv8Z+0gUyik=",
+        "B" to "fAS+otFLkKsKAJzu3yU+rGOlbbFVq+u+LaS6+s1eCJs=",
+        "m" to "Oy45fQVK9kq9019+VysXVlz1F9S1YwYKgXyzGlZrijo=",
+        "F" to "aoDIdXezm2l3HrcnQdkPJTDT8+W6mcl2/02ewBHfPzg="
+    )
+
+    private val seeds32 = mapOf(
+        "A" to "yH6MXnMEcDVWO/9a6P9W92BAh1eRLVFxFlWTHUqQ474=",
+        "V" to "RK7y4dZ0azs9Uqz+bbFB46Bx2K9EHg74ndxknY9uknA=",
+        "N" to "rqr9HeTQOg8TlFiIGZpJaxcvAaKHwMwrkqojJCpcvoc=",
+        "P" to "/4GPpmZXYpn5RpkP7FC/dt8SXz7W30nUZTe8wb+3xmU=",
+        "k" to "wsSGSBXKWA9q1oDJpjtJddVxH+evCfL5SO9HZnUDFU8="
+    )
+
+    private val prefixKeys = mapOf(
+        "O" to "l9PavRg=",
+        "v" to "Ml2v7ag1Jg==",
+        "L" to "i/Va0UxrbMo=",
+        "p" to "WFjKAHGEkQM=",
+        "W" to "5Rr27rWd"
+    )
+
+    private fun add8(n: Int): (Int) -> Int = { c -> (c + n) and 0xFF }
+    private fun sub8(n: Int): (Int) -> Int = { c -> (c - n + 256) and 0xFF }
+    private fun rotl8(n: Int): (Int) -> Int = { c -> ((c shl n) or (c ushr (8 - n))) and 0xFF }
+    private fun rotr8(n: Int): (Int) -> Int = { c -> ((c ushr n) or (c shl (8 - n))) and 0xFF }
+
+    private val scheduleC = listOf(
+        sub8(223), rotr8(4), rotr8(4), add8(234), rotr8(7),
+        rotr8(2), rotr8(7), sub8(223), rotr8(7), rotr8(6)
+    )
+
+    private val scheduleY = listOf(
+        add8(19), rotr8(7), add8(19), rotr8(6), add8(19),
+        rotr8(1), add8(19), rotr8(6), rotr8(7), rotr8(4)
+    )
+
+    private val scheduleB = listOf(
+        sub8(223), rotr8(1), add8(19), sub8(223), rotl8(2),
+        sub8(223), add8(19), rotl8(1), rotl8(2), rotl8(1)
+    )
+
+    private val scheduleJ = listOf(
+        add8(19), rotl8(1), rotl8(1), rotr8(1), add8(234),
+        rotl8(1), sub8(223), rotl8(6), rotl8(4), rotl8(1)
+    )
+
+    private val scheduleE = listOf(
+        rotr8(1), rotl8(1), rotl8(6), rotr8(1), rotl8(2),
+        rotr8(4), rotl8(1), rotl8(1), sub8(223), rotl8(2)
+    )
+
+    fun generate(input: String): String {
+        val encodedInput = URLEncoder.encode(input, "UTF-8").replace("+", "%20")
+        var bytes = encodedInput.toByteArray(Charsets.UTF_8)
+
+        bytes = rc4(atob(rc4Keys["l"]!!), bytes)
+        bytes = transform(bytes, atob(seeds32["A"]!!), atob(prefixKeys["O"]!!), scheduleC)
+
+        bytes = rc4(atob(rc4Keys["g"]!!), bytes)
+        bytes = transform(bytes, atob(seeds32["V"]!!), atob(prefixKeys["v"]!!), scheduleY)
+
+        bytes = rc4(atob(rc4Keys["B"]!!), bytes)
+        bytes = transform(bytes, atob(seeds32["N"]!!), atob(prefixKeys["L"]!!), scheduleB)
+
+        bytes = rc4(atob(rc4Keys["m"]!!), bytes)
+        bytes = transform(bytes, atob(seeds32["P"]!!), atob(prefixKeys["p"]!!), scheduleJ)
+
+        bytes = rc4(atob(rc4Keys["F"]!!), bytes)
+        bytes = transform(bytes, atob(seeds32["k"]!!), atob(prefixKeys["W"]!!), scheduleE)
+
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+    }
+
+    private fun atob(str: String): ByteArray = Base64.getDecoder().decode(str)
+
+    private fun rc4(key: ByteArray, input: ByteArray): ByteArray {
+        val s = IntArray(256) { it }
+        var j = 0
+
+        for (i in 0..255) {
+            j = (j + s[i] + key[i % key.size].toInt().and(0xFF)) and 0xFF
+            val temp = s[i]
+            s[i] = s[j]
+            s[j] = temp
+        }
+
+        val output = ByteArray(input.size)
+        var i = 0
+        j = 0
+        for (k in input.indices) {
+            i = (i + 1) and 0xFF
+            j = (j + s[i]) and 0xFF
+            val temp = s[i]
+            s[i] = s[j]
+            s[j] = temp
+            val t = (s[i] + s[j]) and 0xFF
+            val kByte = s[t]
+            output[k] = (input[k].toInt() xor kByte).toByte()
+        }
+        return output
+    }
+
+    private fun transform(
+        input: ByteArray,
+        seed: ByteArray,
+        prefix: ByteArray,
+        schedule: List<(Int) -> Int>
+    ): ByteArray {
+        val out = ByteArrayOutputStream()
+        for (i in input.indices) {
+            if (i < prefix.size) {
+                out.write(prefix[i].toInt())
+            }
+            val inputByte = input[i].toInt() and 0xFF
+            val seedByte = seed[i % 32].toInt() and 0xFF
+            val xored = inputByte xor seedByte
+            val transformed = schedule[i % 10](xored)
+            out.write(transformed)
+        }
+        return out.toByteArray()
+    }
 }
 
 public object SSLUtils {
