@@ -1,9 +1,13 @@
 package org.koitharu.kotatsu.parsers.site.en
 
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
+import org.koitharu.kotatsu.parsers.bitmap.Bitmap
+import org.koitharu.kotatsu.parsers.bitmap.Rect
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
@@ -15,10 +19,11 @@ import java.util.*
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import kotlin.math.min
 
 @MangaSourceParser("MANGAGO", "Mangago", "en")
 internal class MangagoParser(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.MANGAGO, pageSize = 20) {
+    PagedMangaParser(context, MangaParserSource.MANGAGO, pageSize = 20), Interceptor {
 
     override val configKeyDomain = ConfigKey.Domain("www.mangago.me")
 
@@ -101,43 +106,63 @@ internal class MangagoParser(context: MangaLoaderContext) :
             return parseMangaList(webClient.httpGet(url).parseHtml())
         }
 
-        // Browse with filters
-        val url = buildString {
-            append("https://")
-            append(domain)
-            append("/genre/")
-
-            // Genres
-            if (filter.tags.isNotEmpty()) {
-                filter.tags.joinTo(this, ",") { it.key }
-            } else {
-                append("all")
+        // Build URL based on sort order
+        val url = when (order) {
+            SortOrder.NEWEST -> {
+                // Use list/new for newest
+                buildString {
+                    append("https://")
+                    append(domain)
+                    append("/list/new/")
+                    if (filter.tags.isNotEmpty()) {
+                        filter.tags.joinTo(this, ",") { it.key }
+                    } else {
+                        append("all")
+                    }
+                    append("/")
+                    append(page)
+                    append("/")
+                }
             }
+            else -> {
+                // Use genre for other sort orders
+                buildString {
+                    append("https://")
+                    append(domain)
+                    append("/genre/")
 
-            append("/")
-            append(page)
-            append("/?")
+                    // Genres
+                    if (filter.tags.isNotEmpty()) {
+                        filter.tags.joinTo(this, ",") { it.key }
+                    } else {
+                        append("all")
+                    }
 
-            // Status filters
-            val states = filter.states
-            append("f=")
-            append(if (states.contains(MangaState.FINISHED)) "1" else "0")
-            append("&o=")
-            append(if (states.contains(MangaState.ONGOING)) "1" else "0")
+                    append("/")
+                    append(page)
+                    append("/?")
 
-            // Sort order
-            append("&sortby=")
-            when (order) {
-                SortOrder.POPULARITY -> append("view")
-                SortOrder.UPDATED -> append("update_date")
-                SortOrder.NEWEST -> append("create_date")
-                else -> append("update_date")
-            }
+                    // Status filters
+                    val states = filter.states
+                    append("f=")
+                    append(if (states.contains(MangaState.FINISHED)) "1" else "0")
+                    append("&o=")
+                    append(if (states.contains(MangaState.ONGOING)) "1" else "0")
 
-            // Excluded genres
-            append("&e=")
-            if (filter.tagsExclude.isNotEmpty()) {
-                filter.tagsExclude.joinTo(this, ",") { it.key }
+                    // Sort order
+                    append("&sortby=")
+                    when (order) {
+                        SortOrder.POPULARITY -> append("view")
+                        SortOrder.UPDATED -> append("update_date")
+                        else -> append("update_date")
+                    }
+
+                    // Excluded genres
+                    append("&e=")
+                    if (filter.tagsExclude.isNotEmpty()) {
+                        filter.tagsExclude.joinTo(this, ",") { it.key }
+                    }
+                }
             }
         }
 
@@ -145,11 +170,13 @@ internal class MangagoParser(context: MangaLoaderContext) :
     }
 
     private fun parseMangaList(doc: Document): List<Manga> {
-        return doc.select(".updatesli, .pic_list > li").map { element ->
-            val linkElement = element.selectFirstOrThrow(".thm-effect")
-            val href = linkElement.attrAsRelativeUrl("href")
-            val title = linkElement.attr("title")
-            val thumbnailElem = linkElement.selectFirstOrThrow("img")
+        return doc.select(".box, .updatesli, .pic_list > li").mapNotNull { element ->
+            val linkElement = element.selectFirst(".thm-effect") ?: return@mapNotNull null
+            val href = linkElement.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
+            val title = linkElement.attr("title").ifEmpty {
+                linkElement.selectFirst("h2 a")?.text() ?: return@mapNotNull null
+            }
+            val thumbnailElem = linkElement.selectFirst("img") ?: return@mapNotNull null
             val thumbnailUrl = thumbnailElem.attr("abs:data-src").ifEmpty {
                 thumbnailElem.attr("abs:src")
             }
@@ -328,17 +355,68 @@ internal class MangagoParser(context: MangaLoaderContext) :
     }
 
     override suspend fun getPageUrl(page: MangaPage): String {
-        // If it's a mobile page URL, fetch the image from that page
-        if (!page.url.startsWith("http")) {
-            return page.url
+        // Check if it's a mobile page URL (relative URL without protocol)
+        if (page.url.contains("/pg-")) {
+            val doc = webClient.httpGet(page.url.toAbsoluteUrl(domain)).parseHtml()
+            return doc.selectFirst("div#viewer img")?.absUrl("src")
+                ?: throw Exception("Could not find image")
         }
 
-        val doc = webClient.httpGet(page.url.toAbsoluteUrl(domain)).parseHtml()
-        return doc.selectFirst("div#viewer img")?.absUrl("src")
-            ?: throw Exception("Could not find image")
+        // Desktop image URL - return as is (fragment contains descrambling parameters)
+        return page.url
     }
 
     override suspend fun getRelatedManga(seed: Manga): List<Manga> = emptyList()
+
+    // Interceptor for image descrambling
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val response = chain.proceed(chain.request())
+        val fragment = response.request.url.fragment
+
+        if (fragment == null || !fragment.contains("desckey=")) {
+            return response
+        }
+
+        return context.redrawImageResponse(response) { bitmap ->
+            val key = fragment.substringAfter("desckey=").substringBefore("&")
+            val cols = fragment.substringAfter("cols=").toIntOrNull() ?: return@redrawImageResponse bitmap
+            unscrambleImage(bitmap, key, cols)
+        }
+    }
+
+    private fun unscrambleImage(bitmap: Bitmap, key: String, cols: Int): Bitmap {
+        val width = bitmap.width
+        val height = bitmap.height
+
+        val result = context.createBitmap(width, height)
+
+        val unitWidth = width / cols
+        val unitHeight = height / cols
+
+        val keyArray = key.split("a")
+
+        for (idx in 0 until cols * cols) {
+            val keyval = keyArray.getOrNull(idx)?.takeIf { it.isNotEmpty() }?.toIntOrNull() ?: 0
+
+            val heightY = keyval / cols
+            val dy = heightY * unitHeight
+            val dx = (keyval - heightY * cols) * unitWidth
+
+            val widthY = idx / cols
+            val sy = widthY * unitHeight
+            val sx = (idx - widthY * cols) * unitWidth
+
+            val w = min(unitWidth, width - dx)
+            val h = min(unitHeight, height - dy)
+
+            val srcRect = Rect(sx, sy, sx + w, sy + h)
+            val dstRect = Rect(dx, dy, dx + w, dy + h)
+
+            result.drawBitmap(bitmap, srcRect, dstRect)
+        }
+
+        return result
+    }
 
     // Helper methods for decryption and descrambling
 
