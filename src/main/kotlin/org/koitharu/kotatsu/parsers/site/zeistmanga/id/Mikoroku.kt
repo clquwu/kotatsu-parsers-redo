@@ -9,10 +9,9 @@ import org.koitharu.kotatsu.parsers.model.MangaTag
 import org.koitharu.kotatsu.parsers.site.zeistmanga.ZeistMangaParser
 import org.koitharu.kotatsu.parsers.util.*
 
-@Broken
 @MangaSourceParser("MIKOROKU", "Mikoroku", "id", ContentType.HENTAI)
 internal class Mikoroku(context: MangaLoaderContext) :
-	ZeistMangaParser(context, MangaParserSource.MIKOROKU, "www.mikoroku.web.id") {
+	ZeistMangaParser(context, MangaParserSource.MIKOROKU, "www.mikoroku.com") {
 
 	override suspend fun fetchAvailableTags(): Set<MangaTag> {
 		val doc = webClient.httpGet("https://$domain").parseHtml()
