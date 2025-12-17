@@ -1,0 +1,16 @@
+package org.koitharu.kotatsu.parsers.site.mangareader.id
+
+import org.koitharu.kotatsu.parsers.MangaLoaderContext
+import org.koitharu.kotatsu.parsers.MangaSourceParser
+import org.koitharu.kotatsu.parsers.model.MangaListFilterCapabilities
+import org.koitharu.kotatsu.parsers.model.MangaParserSource
+import org.koitharu.kotatsu.parsers.site.mangareader.MangaReaderParser
+
+@MangaSourceParser("KUMOPOI", "KumoPoi", "id")
+internal class KumoPoi(context: MangaLoaderContext) :
+	MangaReaderParser(context, MangaParserSource.KUMOPOI, "kumopoi.org", pageSize = 20, searchPageSize = 100) {
+	override val filterCapabilities: MangaListFilterCapabilities
+		get() = super.filterCapabilities.copy(
+			isTagsExclusionSupported = false,
+		)
+}
