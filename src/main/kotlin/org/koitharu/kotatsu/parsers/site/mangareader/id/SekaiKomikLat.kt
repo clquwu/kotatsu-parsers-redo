@@ -8,8 +8,8 @@ import org.koitharu.kotatsu.parsers.model.MangaParserSource
 import org.koitharu.kotatsu.parsers.site.mangareader.MangaReaderParser
 
 @MangaSourceParser("SEKAIKOMIKLAT", "SekaiKomikLat", "id")
-internal class WarungKomik(context: MangaLoaderContext) :
-	MangaReaderParser(context, MangaParserSource.WARUNGKOMIK, "www.sekaikomik.lat", pageSize = 20, searchPageSize = 10) {
+internal class SekaiKomikLat(context: MangaLoaderContext) :
+	MangaReaderParser(context, MangaParserSource.SEKAIKOMIKLAT, "www.sekaikomik.lat", pageSize = 20, searchPageSize = 10) {
 	override val filterCapabilities: MangaListFilterCapabilities
 		get() = super.filterCapabilities.copy(
 			isTagsExclusionSupported = false,
