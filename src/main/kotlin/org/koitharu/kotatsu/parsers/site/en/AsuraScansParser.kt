@@ -159,9 +159,8 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 		tagMap
 	}
 
-	// matches: {"name":112,"title":"Political Scene...","id":26511,"published_at":"2025-12-16T01:17:12.000000Z",...}
-	private val regexChapter = """"name":(\d+),"title":"([^"]*)","id":(\d+),"published_at":"([^"]+)"""".toRegex()
-	private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
+	private val regexDate = """(\d+)(st|nd|rd|th)""".toRegex()
+	private val dateFormat = SimpleDateFormat("MMMM d yyyy", Locale.US)
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
@@ -169,64 +168,57 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 		val selectTag = doc.select("div[class^=space] > div.flex > button.text-white")
 		val tags = selectTag.mapNotNullToSet { tagMap[it.text()] }
 		val author = doc.selectFirst("div.grid > div:has(h3:eq(0):containsOwn(Author)) > h3:eq(1)")?.text().orEmpty()
-
-		val nextData = doc.selectOrThrow("script").mapNotNull { x ->
-			x.data().substringBetween("self.__next_f.push(", ")", "")
-				.trim()
-				.nullIfEmpty()
-		}.flatMap { it.jsonStrings() }
-			.joinToString("")
-
-		// extract manga slug from url for chapter url construction
-		// url format: https://asuracomic.net/series/{mangaSlug}/chapter/{chapterNum}
-		val mangaSlug = manga.url.substringAfter("/series/").substringBefore("/")
-
-		// we parse chapters directly from json data here 
-		// to avoid the url series hash that changes everyday
-		val chapters = regexChapter.findAll(nextData).mapNotNull { match ->
-			val chapterNum = match.groupValues[1].toIntOrNull() ?: return@mapNotNull null
-			val chapterTitle = match.groupValues[2]
-			val chapterId = match.groupValues[3].toLongOrNull() ?: return@mapNotNull null
-			val publishedAt = match.groupValues[4]
-
-			val url = "https://$domain/series/$mangaSlug/chapter/$chapterNum"
-
-			MangaChapter(
-				id = generateUid(chapterId.toString()),
-				title = "Chapter $chapterNum" + if (chapterTitle.isNotEmpty()) " - $chapterTitle" else "",
-				number = chapterNum.toFloat(),
-				volume = 0,
-				url = url,
-				scanlator = null,
-				uploadDate = dateFormat.parseSafe(publishedAt.substringBefore(".")),
-				branch = null,
-				source = source,
-			)
-		}.sortedBy { it.number }.toList()
-
 		return manga.copy(
 			description = doc.selectFirst("span.font-medium.text-sm")?.text().orEmpty(),
 			tags = tags,
 			authors = setOf(author),
-			chapters = chapters,
+			chapters = doc.select("div.scrollbar-thumb-themecolor > div.group").mapChapters(reversed = true) { i, div ->
+				val a = div.selectLastOrThrow("a")
+				val urlRelative = "/series/" + a.attrAsRelativeUrl("href")
+				val url = urlRelative.toAbsoluteUrl(domain)
+				val urlParts = urlRelative.split("/chapter/")
+				val slugWithHash = urlParts.firstOrNull()?.substringAfter("/series/").orEmpty()
+				val slug = slugWithHash.substringBeforeLast("-") // remove hash for consistent id
+				val chapterNum = urlParts.lastOrNull().orEmpty()
+				val stableUrl = "/series/$slug/chapter/$chapterNum"
+				val date = div.selectLast("h3")?.text().orEmpty()
+				val cleanDate = date.replace(regexDate, "$1")
+				MangaChapter(
+					id = generateUid(stableUrl),
+					title = div.selectFirst("h3")?.textOrNull(),
+					number = i + 1f,
+					volume = 0,
+					url = url,
+					scanlator = null,
+					uploadDate = synchronized(dateFormat) { dateFormat.parseSafe(cleanDate) },
+					branch = null,
+					source = source,
+				)
+			},
 		)
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-		val data = doc.selectOrThrow("script").mapNotNull { x ->
-			x.data().substringBetween("self.__next_f.push(", ")", "")
-				.trim()
-				.nullIfEmpty()
-		}.flatMap { it.jsonStrings() }
-			.joinToString("")
-			.split('\n')
-			.mapNotNull { x ->
-				x.substringAfter(':').toJSONObjectOrNull()
+		val scripts = doc.selectOrThrow("script")
+		val sb = StringBuilder()
+		for (script in scripts) {
+			val raw = script.data().substringBetween("self.__next_f.push(", ")", "").trim()
+			if (raw.isEmpty()) continue
+			val ja = raw.toJSONArrayOrNull() ?: continue
+			for (i in 0 until ja.length()) {
+				(ja.opt(i) as? String)?.let { sb.append(it) }
 			}
-		val pages = data.filter { it.has("order") && it.has("url") }
-			.associate { it.getInt("order") to it.getString("url") }.values
-		return pages.map { url ->
+		}
+		val lines = sb.toString().split('\n')
+		val pages = TreeMap<Int, String>()
+		for (line in lines) {
+			val obj = line.substringAfter(':').toJSONObjectOrNull() ?: continue
+			if (obj.has("order") && obj.has("url")) {
+				pages[obj.getInt("order")] = obj.getString("url")
+			}
+		}
+		return pages.values.map { url ->
 			MangaPage(
 				id = generateUid(url),
 				url = url,
@@ -234,16 +226,5 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 				source = source,
 			)
 		}
-	}
-
-	private fun String.jsonStrings(): List<String> {
-		val ja = toJSONArrayOrNull() ?: return emptyList()
-		val result = ArrayList<String>(ja.length())
-		repeat(ja.length()) { i ->
-			(ja.get(i) as? String)?.let { item ->
-				result.add(item)
-			}
-		}
-		return result
 	}
 }
