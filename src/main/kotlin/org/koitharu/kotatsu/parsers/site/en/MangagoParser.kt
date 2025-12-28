@@ -4,6 +4,7 @@ import okhttp3.Interceptor
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import org.koitharu.kotatsu.parsers.Broken
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.bitmap.Bitmap
@@ -21,6 +22,7 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.min
 
+@Broken("Need to work image decrypt")
 @MangaSourceParser("MANGAGO", "Mangago", "en")
 internal class MangagoParser(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.MANGAGO, pageSize = 20), Interceptor {
