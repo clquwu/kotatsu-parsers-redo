@@ -82,8 +82,8 @@ internal class AtsuMoe(context: MangaLoaderContext) :
         val title = json.optString("title").ifEmpty {
             json.optString("englishTitle", "Unknown")
         }
-        val poster = json.optString("poster")
-        val coverUrl = if (poster.isNotEmpty()) "https://$domain$poster" else null
+        val image = json.optString("image")
+        val coverUrl = if (image.isNotEmpty()) "https://$domain/static/$image" else null
 
         return Manga(
             id = generateUid(id),
@@ -109,18 +109,23 @@ internal class AtsuMoe(context: MangaLoaderContext) :
         val title = mangaPage.optString("title").ifEmpty {
             mangaPage.optString("englishTitle", manga.title)
         }
-        val description = mangaPage.optString("description")
-        val poster = mangaPage.optString("poster")
-        val coverUrl = if (poster.isNotEmpty()) "https://$domain$poster" else manga.coverUrl
+        val description = mangaPage.optString("synopsis")
 
-        // Parse tags/genres
-        val genresArray = mangaPage.optJSONArray("genres")
-        val tags = if (genresArray != null) {
-            (0 until genresArray.length()).map { i ->
-                val genre = genresArray.getString(i)
+        // Parse poster object
+        val posterObj = mangaPage.optJSONObject("poster")
+        val posterImage = posterObj?.optString("image")
+        val coverUrl = if (!posterImage.isNullOrEmpty()) {
+            "https://$domain/static/$posterImage"
+        } else manga.coverUrl
+
+        // Parse tags
+        val tagsArray = mangaPage.optJSONArray("tags")
+        val tags = if (tagsArray != null) {
+            (0 until tagsArray.length()).map { i ->
+                val tag = tagsArray.getJSONObject(i)
                 MangaTag(
-                    key = genre.lowercase(),
-                    title = genre,
+                    key = tag.getString("id"),
+                    title = tag.getString("name"),
                     source = source
                 )
             }.toSet()
@@ -130,7 +135,8 @@ internal class AtsuMoe(context: MangaLoaderContext) :
         val authorsArray = mangaPage.optJSONArray("authors")
         val authors = if (authorsArray != null) {
             (0 until authorsArray.length()).mapNotNull { i ->
-                authorsArray.optString(i).takeIf { it.isNotEmpty() }
+                val author = authorsArray.getJSONObject(i)
+                author.optString("name").takeIf { it.isNotEmpty() }
             }.toSet()
         } else emptySet<String>()
 
@@ -144,16 +150,14 @@ internal class AtsuMoe(context: MangaLoaderContext) :
             else -> null
         }
 
-        // Parse content rating
-        val contentRating = when (mangaPage.optString("contentRating").lowercase()) {
-            "safe" -> ContentRating.SAFE
-            "suggestive" -> ContentRating.SUGGESTIVE
-            "nsfw", "erotica" -> ContentRating.ADULT
-            else -> ContentRating.SAFE
-        }
-
-        // Fetch chapters
-        val chapters = fetchAllChapters(mangaId)
+        // Parse chapters from mangaPage
+        val chaptersArray = mangaPage.optJSONArray("chapters")
+        val chapters = if (chaptersArray != null) {
+            (0 until chaptersArray.length()).map { i ->
+                val chapter = chaptersArray.getJSONObject(i)
+                parseChapter(chapter, mangaId)
+            }
+        } else emptyList()
 
         return manga.copy(
             title = title,
@@ -162,48 +166,32 @@ internal class AtsuMoe(context: MangaLoaderContext) :
             tags = tags,
             authors = authors,
             state = state,
-            contentRating = contentRating,
             chapters = chapters
         )
     }
 
-    private suspend fun fetchAllChapters(mangaId: String): List<MangaChapter> {
-        val allChapters = mutableListOf<MangaChapter>()
-        var currentPage = 0
-        var hasMore = true
-
-        while (hasMore) {
-            val url = "${apiUrl}manga/chapters?id=$mangaId&filter=all&sort=desc&page=$currentPage"
-            val json = webClient.httpGet(url).parseJson()
-            val chapters = json.getJSONArray("chapters")
-            val total = json.getInt("total")
-
-            for (i in 0 until chapters.length()) {
-                val chapter = chapters.getJSONObject(i)
-                allChapters.add(parseChapter(chapter, mangaId))
-            }
-
-            currentPage++
-            hasMore = allChapters.size < total
-        }
-
-        return allChapters
-    }
-
     private fun parseChapter(json: JSONObject, mangaId: String): MangaChapter {
-        val chapterId = json.getString("name")
+        val chapterId = json.getString("id")
         val title = json.optString("title").takeIf { it.isNotEmpty() }
-        val number = json.optString("number", "0").toFloatOrNull() ?: 0f
-        val volume = json.optInt("volume", 0)
-        val createdAt = json.optLong("createdAt", 0L)
+        val number = json.optInt("number", 0).toFloat()
+
+        // Parse ISO date string to timestamp
+        val createdAtStr = json.optString("createdAt")
+        val uploadDate = if (createdAtStr.isNotEmpty()) {
+            try {
+                parseDate(createdAtStr)
+            } catch (e: Exception) {
+                0L
+            }
+        } else 0L
 
         return MangaChapter(
             id = generateUid("$mangaId/$chapterId"),
             title = title,
             number = number,
-            volume = volume,
+            volume = 0,
             url = "$mangaId/$chapterId",
-            uploadDate = createdAt,
+            uploadDate = uploadDate,
             source = source,
             scanlator = null,
             branch = null
