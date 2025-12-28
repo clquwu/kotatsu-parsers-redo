@@ -8,6 +8,7 @@ import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
+import java.text.SimpleDateFormat
 import java.util.*
 
 @MangaSourceParser("ATSUMOE", "Atsu.moe", "en")
@@ -16,6 +17,10 @@ internal class AtsuMoe(context: MangaLoaderContext) :
 
     override val configKeyDomain = ConfigKey.Domain("atsu.moe")
     private val apiUrl = "https://$domain/api/"
+
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ENGLISH).apply {
+        timeZone = TimeZone.getTimeZone("UTC")
+    }
 
     override val availableSortOrders: Set<SortOrder> = EnumSet.of(
         SortOrder.POPULARITY,
@@ -179,7 +184,7 @@ internal class AtsuMoe(context: MangaLoaderContext) :
         val createdAtStr = json.optString("createdAt")
         val uploadDate = if (createdAtStr.isNotEmpty()) {
             try {
-                parseDate(createdAtStr)
+                dateFormat.parse(createdAtStr)?.time ?: 0L
             } catch (e: Exception) {
                 0L
             }
