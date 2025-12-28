@@ -4,7 +4,6 @@ import okhttp3.Interceptor
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import org.koitharu.kotatsu.parsers.Broken
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.bitmap.Bitmap
@@ -22,7 +21,6 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.min
 
-@Broken("Need to work image decrypt")
 @MangaSourceParser("MANGAGO", "Mangago", "en")
 internal class MangagoParser(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.MANGAGO, pageSize = 20), Interceptor {
@@ -93,6 +91,12 @@ internal class MangagoParser(context: MangaLoaderContext) :
     }
 
     private val dateFormat = SimpleDateFormat("MMM d, yyyy", Locale.ENGLISH)
+
+    init {
+        context.cookieJar.insertCookies(domain, "_m_superu", "1")
+        context.cookieJar.insertCookies(domain, "adult_confirmed", "1")
+        context.cookieJar.insertCookies(domain, "stay", "1")
+    }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         if (!filter.query.isNullOrEmpty()) {
@@ -263,7 +267,7 @@ internal class MangagoParser(context: MangaLoaderContext) :
                 }.getOrNull() ?: 0L
 
                 val scanlator = element.selectFirst("td.no a, td.uk-table-shrink a")?.text()?.trim()
-                    ?.ifEmpty { null }
+                    ?.ifEmpty { null } ?: return@mapIndexedNotNull null
 
                 MangaChapter(
                     id = generateUid(url),
@@ -310,7 +314,7 @@ internal class MangagoParser(context: MangaLoaderContext) :
         val iv = findHexEncodedVariable(deobfChapterJs, "iv").decodeHex()
 
         // Decrypt image list
-        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        val cipher = Cipher.getInstance("AES/CBC/NoPadding")
         val keySpec = SecretKeySpec(key, "AES")
         cipher.init(Cipher.DECRYPT_MODE, keySpec, IvParameterSpec(iv))
         val decryptedBytes = cipher.doFinal(imgsrcs)
@@ -325,17 +329,19 @@ internal class MangagoParser(context: MangaLoaderContext) :
         val cols = COLS_REGEX.find(deobfChapterJs)?.groupValues?.get(1) ?: ""
 
         // Build page list
-        return imageList.split(",").mapIndexed { index, imageUrl ->
-            val url = if (imageUrl.contains("cspiclink")) {
+        return imageList.split(",").mapIndexed {
+            index, imageUrl ->
+            var finalUrl = imageUrl
+            if (imageUrl.contains("cspiclink")) {
                 val descramblingKey = getDescramblingKey(deobfChapterJs, imageUrl)
-                "$imageUrl#desckey=$descramblingKey&cols=$cols"
-            } else {
-                imageUrl
+                if (descramblingKey.isNotEmpty()) {
+                    finalUrl = "$imageUrl#desckey=$descramblingKey&cols=$cols"
+                }
             }
 
             MangaPage(
                 id = generateUid("$fullUrl-$index"),
-                url = url,
+                url = finalUrl,
                 preview = null,
                 source = source,
             )
@@ -346,7 +352,8 @@ internal class MangagoParser(context: MangaLoaderContext) :
         val pagesCount = doc.select("div.controls ul#dropdown-menu-page li").size
         val pageUrl = doc.location().removeSuffix("/").substringBeforeLast("-")
 
-        return (1..pagesCount).map { pageNum ->
+        return (1..pagesCount).map {
+            pageNum ->
             MangaPage(
                 id = generateUid("$pageUrl-$pageNum"),
                 url = "$pageUrl-$pageNum/",
@@ -372,7 +379,19 @@ internal class MangagoParser(context: MangaLoaderContext) :
 
     // Interceptor for image descrambling
     override fun intercept(chain: Interceptor.Chain): Response {
-        val response = chain.proceed(chain.request())
+        val request = chain.request()
+        val url = request.url.toString()
+
+        val newRequest = if (url.contains("mangapicgallery.com")) {
+            request.newBuilder()
+                .header("Referer", "https://$domain/")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .build()
+        } else {
+            request
+        }
+
+        val response = chain.proceed(newRequest)
         val fragment = response.request.url.fragment
 
         if (fragment == null || !fragment.contains("desckey=")) {
@@ -434,7 +453,7 @@ internal class MangagoParser(context: MangaLoaderContext) :
     }
 
     private fun findHexEncodedVariable(input: String, variable: String): String {
-        val regex = Regex("""var $variable\s*=\s*CryptoJS\.enc\.Hex\.parse\("([0-9a-zA-Z]+)"\)""")
+        val regex = Regex("""var $variable\s*=\s*CryptoJS\.enc\.Hex\.parse\(\"([0-9a-zA-Z]+)\"\)""" )
         return regex.find(input)?.groupValues?.get(1)
             ?: throw Exception("Could not find variable: $variable")
     }
@@ -456,7 +475,8 @@ internal class MangagoParser(context: MangaLoaderContext) :
                 imgList[it].toString().toInt()
             }
 
-            keyLocations.forEachIndexed { idx, it ->
+            keyLocations.forEachIndexed {
+                idx, it ->
                 imgList = imgList.removeRange(it - idx..it - idx)
             }
 
@@ -481,26 +501,35 @@ internal class MangagoParser(context: MangaLoaderContext) :
         return s
     }
 
-    private fun getDescramblingKey(deobfChapterJs: String, imageUrl: String): String {
-        // Extract the key generation logic from the deobfuscated JavaScript
+    private suspend fun getDescramblingKey(deobfChapterJs: String, imageUrl: String): String {
         val imgkeys = deobfChapterJs
-            .substringAfter("var renImg = function(img,width,height,id){", "")
-            .substringBefore("key = key.split(", "")
+            .substringAfter("var renImg = function(img,width,height,id){")
+            .substringBefore("key = key.split(")
+            .lineSequence()
+            .filter { line -> JS_FILTERS.none { line.contains(it) } }
+            .joinToString("\n")
+            .replace("img.src", "url")
 
-        if (imgkeys.isEmpty()) {
-            return ""
+        val js = """
+            function replacePos(strObj, pos, replacetext) {
+                var str = strObj.substr(0, pos) + replacetext + strObj.substring(pos + 1, strObj.length);
+                return str;
+            }
+            function getDescramblingKey(url) { $imgkeys; return key; }
+            getDescramblingKey(\"$imageUrl\");
+        """.trimIndent()
+
+        return try {
+            context.evaluateJs("https://$domain", js, 10000L) ?: ""
+        } catch (e: Exception) {
+            ""
         }
-
-        // Parse the JavaScript to extract the descrambling key
-        // This is a simplified version - the full implementation would need JS evaluation
-        // For now, return empty string which means images won't be descrambled
-        // but will still load (they'll just be scrambled)
-        return ""
     }
 
     companion object {
-        private val IMG_SRCS_REGEX = Regex("""var imgsrcs\s*=\s*['"]([a-zA-Z0-9+=/]+)['"]""")
-        private val COLS_REGEX = Regex("""var\s*widthnum\s*=\s*heightnum\s*=\s*(\d+);""")
-        private val KEY_LOCATION_REGEX = Regex("""str\.charAt\(\s*(\d+)\s*\)""")
+        private val IMG_SRCS_REGEX = Regex("""var imgsrcs\s*=\s*['"]([a-zA-Z0-9+=/]+)['"]""" )
+        private val COLS_REGEX = Regex("""var\s*widthnum\s*=\s*heightnum\s*=\s*(\d+);""" )
+        private val KEY_LOCATION_REGEX = Regex("""str\.charAt\(\s*(\d+)\s*\)""" )
+        private val JS_FILTERS = listOf("jQuery", "document", "getContext", "toDataURL", "getImageData", "width", "height")
     }
 }
