@@ -4,7 +4,6 @@ import okhttp3.Interceptor
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import org.koitharu.kotatsu.parsers.Broken
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.bitmap.Bitmap
@@ -22,7 +21,6 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.min
 
-@Broken("Need to work image decrypt")
 @MangaSourceParser("MANGAGO", "Mangago", "en")
 internal class MangagoParser(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.MANGAGO, pageSize = 20), Interceptor {
@@ -263,7 +261,7 @@ internal class MangagoParser(context: MangaLoaderContext) :
                 }.getOrNull() ?: 0L
 
                 val scanlator = element.selectFirst("td.no a, td.uk-table-shrink a")?.text()?.trim()
-                    ?.ifEmpty { null }
+                    ?.ifEmpty { null } ?: null
 
                 MangaChapter(
                     id = generateUid(url),
@@ -325,7 +323,8 @@ internal class MangagoParser(context: MangaLoaderContext) :
         val cols = COLS_REGEX.find(deobfChapterJs)?.groupValues?.get(1) ?: ""
 
         // Build page list
-        return imageList.split(",").mapIndexed { index, imageUrl ->
+        return imageList.split(",").mapIndexed {
+            index, imageUrl ->
             val url = if (imageUrl.contains("cspiclink")) {
                 val descramblingKey = getDescramblingKey(deobfChapterJs, imageUrl)
                 "$imageUrl#desckey=$descramblingKey&cols=$cols"
@@ -346,7 +345,8 @@ internal class MangagoParser(context: MangaLoaderContext) :
         val pagesCount = doc.select("div.controls ul#dropdown-menu-page li").size
         val pageUrl = doc.location().removeSuffix("/").substringBeforeLast("-")
 
-        return (1..pagesCount).map { pageNum ->
+        return (1..pagesCount).map {
+            pageNum ->
             MangaPage(
                 id = generateUid("$pageUrl-$pageNum"),
                 url = "$pageUrl-$pageNum/",
@@ -434,7 +434,7 @@ internal class MangagoParser(context: MangaLoaderContext) :
     }
 
     private fun findHexEncodedVariable(input: String, variable: String): String {
-        val regex = Regex("""var $variable\s*=\s*CryptoJS\.enc\.Hex\.parse\("([0-9a-zA-Z]+)"\)""")
+        val regex = Regex("""var $variable\s*=\s*CryptoJS\.enc\.Hex\.parse\(\"([0-9a-zA-Z]+)\"\)""")
         return regex.find(input)?.groupValues?.get(1)
             ?: throw Exception("Could not find variable: $variable")
     }
@@ -456,7 +456,8 @@ internal class MangagoParser(context: MangaLoaderContext) :
                 imgList[it].toString().toInt()
             }
 
-            keyLocations.forEachIndexed { idx, it ->
+            keyLocations.forEachIndexed {
+                idx, it ->
                 imgList = imgList.removeRange(it - idx..it - idx)
             }
 
