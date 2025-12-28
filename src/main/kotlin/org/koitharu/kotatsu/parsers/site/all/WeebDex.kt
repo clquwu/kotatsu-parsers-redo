@@ -242,25 +242,35 @@ internal abstract class WeebDexParser(
     }
 
     private fun parseChapterList(json: JSONObject, mangaId: String): List<MangaChapter> {
-        val chapters = mutableListOf<MangaChapter>()
         val data = json.getJSONArray("data")
         val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ENGLISH).apply {
             timeZone = TimeZone.getTimeZone("UTC")
         }
 
+        // Group chapters by chapter number to handle duplicates
+        val chapterMap = mutableMapOf<String, MutableList<ChapterData>>()
+
         for (i in 0 until data.length()) {
             val chapter = data.getJSONObject(i)
+
+            // Filter by language - only include chapters in the requested language
+            val chapterLang = chapter.optString("language", "")
+            if (chapterLang != lang) continue
+
             val chapterId = chapter.getString("id")
-            val chapterNumber = chapter.optDouble("chapter", 0.0).toFloat()
+            val chapterNumber = chapter.optString("chapter", "0")
             val volumeNumber = chapter.optInt("volume", 0)
             val title = chapter.optString("title").takeIf { it.isNotEmpty() }
             val createdAt = chapter.optString("created_at")
+            val version = chapter.optInt("version", 1)
 
             // Get scanlator from relationships
             val relationships = chapter.optJSONObject("relationships")
             val groupsArray = relationships?.optJSONArray("groups")
             val scanlator = if (groupsArray != null && groupsArray.length() > 0) {
-                groupsArray.getJSONObject(0).optString("name")
+                (0 until groupsArray.length()).joinToString(", ") { idx ->
+                    groupsArray.getJSONObject(idx).optString("name")
+                }
             } else null
 
             val date = try {
@@ -269,23 +279,103 @@ internal abstract class WeebDexParser(
                 0L
             }
 
-            chapters.add(
-                MangaChapter(
-                    id = generateUid(chapterId),
-                    title = title,
-                    number = chapterNumber,
-                    volume = volumeNumber,
-                    url = "/manga/$mangaId/chapter/$chapterId",
-                    uploadDate = date,
-                    source = source,
-                    scanlator = scanlator,
-                    branch = null
-                )
+            // Create chapter data object
+            val chapterData = ChapterData(
+                id = chapterId,
+                number = chapterNumber,
+                volume = volumeNumber,
+                title = title,
+                uploadDate = date,
+                scanlator = scanlator,
+                version = version
             )
+
+            // Group by chapter number
+            val key = chapterNumber
+            if (!chapterMap.containsKey(key)) {
+                chapterMap[key] = mutableListOf()
+            }
+            chapterMap[key]!!.add(chapterData)
         }
 
-        return chapters // Already in descending order from API (order=desc)
+        // Process grouped chapters
+        val chapters = mutableListOf<MangaChapter>()
+
+        for ((chapterNum, duplicates) in chapterMap) {
+            if (duplicates.size == 1) {
+                // Single version - just add it
+                val ch = duplicates[0]
+                chapters.add(
+                    MangaChapter(
+                        id = generateUid(ch.id),
+                        title = ch.title,
+                        number = ch.number.toFloatOrNull() ?: 0f,
+                        volume = ch.volume,
+                        url = "/manga/$mangaId/chapter/${ch.id}",
+                        uploadDate = ch.uploadDate,
+                        source = source,
+                        scanlator = ch.scanlator,
+                        branch = null
+                    )
+                )
+            } else {
+                // Multiple versions - prefer highest version number, or add as separate branches
+                val sorted = duplicates.sortedWith(
+                    compareByDescending<ChapterData> { it.version }
+                        .thenByDescending { it.uploadDate }
+                )
+
+                // Add the best version as the main chapter
+                val best = sorted[0]
+                chapters.add(
+                    MangaChapter(
+                        id = generateUid(best.id),
+                        title = best.title,
+                        number = best.number.toFloatOrNull() ?: 0f,
+                        volume = best.volume,
+                        url = "/manga/$mangaId/chapter/${best.id}",
+                        uploadDate = best.uploadDate,
+                        source = source,
+                        scanlator = best.scanlator,
+                        branch = null
+                    )
+                )
+
+                // Add other versions as alternate branches if they're from different groups
+                for (j in 1 until sorted.size) {
+                    val alt = sorted[j]
+                    if (alt.scanlator != best.scanlator) {
+                        chapters.add(
+                            MangaChapter(
+                                id = generateUid(alt.id),
+                                title = alt.title,
+                                number = alt.number.toFloatOrNull() ?: 0f,
+                                volume = alt.volume,
+                                url = "/manga/$mangaId/chapter/${alt.id}",
+                                uploadDate = alt.uploadDate,
+                                source = source,
+                                scanlator = alt.scanlator,
+                                branch = alt.scanlator
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        // Sort by chapter number (ascending) - oldest first for reading order
+        return chapters.sortedBy { it.number }
     }
+
+    private data class ChapterData(
+        val id: String,
+        val number: String,
+        val volume: Int,
+        val title: String?,
+        val uploadDate: Long,
+        val scanlator: String?,
+        val version: Int
+    )
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         // Extract chapter ID from URL: /manga/{mangaId}/chapter/{chapterId}
