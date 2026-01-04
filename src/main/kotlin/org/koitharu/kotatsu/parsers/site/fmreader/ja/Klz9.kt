@@ -53,7 +53,9 @@ internal class Klz9(context: MangaLoaderContext) :
 	private val toPathCharacters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 	override suspend fun getChapters(doc: Document): List<MangaChapter> {
-		val slug = doc.selectFirstOrThrow("div.h0rating").attr("slug")
+		// Try to get slug from div.h0rating, otherwise extract from URL
+		val slug = doc.selectFirst("div.h0rating")?.attr("slug")
+			?: doc.location().substringAfterLast('/').substringBeforeLast(".html")
 		val xhrUrl = "https://$domain/${generateRandomStr()}.lstc".toHttpUrl().newBuilder()
 			.addQueryParameter("slug", slug)
 			.build()

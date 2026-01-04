@@ -98,7 +98,7 @@ internal class WestmangaParser(context: MangaLoaderContext) :
 		}.build()
 
 		val response = webClient.httpGet(url, createApiHeaders(url)).parseJson()
-		val mangaArray = response.getJSONArray("data")
+		val mangaArray = response.optJSONArray("data") ?: return emptyList()
 
 		return mangaArray.mapJSON { jo ->
 			val slug = jo.getString("slug")
@@ -220,7 +220,7 @@ internal class WestmangaParser(context: MangaLoaderContext) :
 
 		val url = "https://$apiDomain/api/contents/genres".toHttpUrl()
 		val response = webClient.httpGet(url, createApiHeaders(url)).parseJson()
-		val genresArray = response.getJSONArray("data")
+		val genresArray = response.optJSONArray("data") ?: return@withLock emptySet()
 
 		val genres = genresArray.mapJSONToSet { genreObj ->
 			MangaTag(

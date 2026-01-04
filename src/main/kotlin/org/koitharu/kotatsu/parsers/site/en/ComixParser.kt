@@ -340,17 +340,55 @@ internal class Comix(context: MangaLoaderContext) :
             page++
         }
 
-        // Group chapters by number and pick one translation per chapter (preferring latest)
-        val uniqueChapters = allChapters
-            .groupBy { it.getDouble("number") }
-            .mapValues { (_, chapters) ->
-                // Sort by creation date descending and take the first (most recent)
-                chapters.maxByOrNull { it.getLong("created_at") }!!
-            }
-            .values
-            .sortedByDescending { it.getDouble("number") } // Sort by chapter number descending
+        // Track how many chapters each team has (to find most complete team)
+        val teamStats = mutableMapOf<String, Int>()
+        val chaptersByNumber = allChapters.groupBy { it.getDouble("number") }
 
-        return uniqueChapters.mapIndexedNotNull { index, item ->
+        // Count chapters per team
+        for (chapter in allChapters) {
+            val scanlationGroup = chapter.optJSONObject("scanlation_group")
+            val teamName = scanlationGroup?.optString("name", null)
+            if (!teamName.isNullOrBlank()) {
+                teamStats[teamName] = teamStats.getOrDefault(teamName, 0) + 1
+            }
+        }
+
+        // Find the team with most chapters (most complete)
+        val mostCompleteTeam = teamStats.maxByOrNull { it.value }?.key
+
+        // Select one version per chapter number
+        val processedChapters = mutableListOf<JSONObject>()
+
+        for ((chapterNumber, chapters) in chaptersByNumber) {
+            // Pick best version using scoring system (similar to ComickFun)
+            val bestChapter = chapters.maxByOrNull { chapter ->
+                val scanlationGroup = chapter.optJSONObject("scanlation_group")
+                val teamName = scanlationGroup?.optString("name", null)
+
+                var score = 0
+
+                // Strongly prefer the most complete team (most chapters overall)
+                if (!teamName.isNullOrBlank() && teamName == mostCompleteTeam) {
+                    score += 1000
+                } else if (!teamName.isNullOrBlank()) {
+                    score += 500 // Some team is better than no team
+                }
+
+                // Prefer more recent uploads
+                val createdAt = chapter.getLong("created_at")
+                score += (createdAt / 1000000).toInt() // Use timestamp as tiebreaker
+
+                score
+            }
+
+            if (bestChapter != null) {
+                processedChapters.add(bestChapter)
+            }
+        }
+
+        val finalChapters = processedChapters.sortedByDescending { it.getDouble("number") }
+
+        return finalChapters.mapIndexedNotNull { index, item ->
             val chapterId = item.getLong("chapter_id")
             val number = item.getDouble("number").toFloat()
             val name = item.optString("name", "").nullIfEmpty()
