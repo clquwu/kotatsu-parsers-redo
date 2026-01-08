@@ -108,6 +108,7 @@ internal class BatoToV4Parser(context: MangaLoaderContext) :
         return items.mapJSON { item ->
             parseManga(item.getJSONObject("data"))
         }
+        
     }
 
     override suspend fun getDetails(manga: Manga): Manga {
