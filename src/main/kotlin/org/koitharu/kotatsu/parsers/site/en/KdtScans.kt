@@ -232,11 +232,32 @@ internal class KdtScans(context: MangaLoaderContext) :
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val fullUrl = chapter.url.toAbsoluteUrl(domain)
 
-        // JavaScript to wait 3 seconds before finishing
+        // JavaScript that polls for the end marker image (reen_wes.webp)
         val pageScript = """
-            setTimeout(() => {
-                console.log('[KdtScans] 3 seconds elapsed, ready to capture');
-            }, 3000);
+            (() => {
+                // Check if the end marker image has loaded
+                const images = document.querySelectorAll('img');
+                for (let img of images) {
+                    if (img.src && img.src.includes('reen_wes.webp')) {
+                        console.log('[KdtScans] Found end marker reen_wes.webp, chapter complete');
+                        return 'END_MARKER_FOUND';
+                    }
+                }
+
+                // Check if we've been waiting for 10 seconds
+                if (typeof window.__kdtStartTime === 'undefined') {
+                    window.__kdtStartTime = Date.now();
+                }
+
+                const elapsed = Date.now() - window.__kdtStartTime;
+                if (elapsed >= 10000) {
+                    console.log('[KdtScans] 10 seconds elapsed, finishing');
+                    return 'TIMEOUT';
+                }
+
+                // Keep polling
+                return null;
+            })();
         """.trimIndent()
 
         // Configure interception to capture all image requests from cdn.asdasdhg.com
@@ -251,16 +272,19 @@ internal class KdtScans(context: MangaLoaderContext) :
 
         println("[KdtScans] Intercepted ${interceptedRequests.size} image requests")
 
-        return interceptedRequests.map { request ->
-            val imageUrl = request.url
-            println("[KdtScans] Image: $imageUrl")
-            MangaPage(
-                id = generateUid(imageUrl),
-                url = imageUrl,
-                preview = null,
-                source = source,
-            )
-        }
+        // Filter out the end marker image (reen_wes.webp)
+        return interceptedRequests
+            .filter { !it.url.contains("reen_wes.webp") }
+            .map { request ->
+                val imageUrl = request.url
+                println("[KdtScans] Image: $imageUrl")
+                MangaPage(
+                    id = generateUid(imageUrl),
+                    url = imageUrl,
+                    preview = null,
+                    source = source,
+                )
+            }
     }
 
     private fun parseStatus(status: String): MangaState? {

@@ -348,7 +348,7 @@ internal class Azoramoon(context: MangaLoaderContext) :
 		val chapterLinks = doc.select("a[href*='/chapter-']")
 		println("[Azoramoon] Found ${chapterLinks.size} chapter links")
 
-		return chapterLinks.mapChapters { i, a ->
+		return chapterLinks.mapIndexedNotNull { i, a ->
 			val url = a.attrAsRelativeUrl("href")
 
 			// Extract chapter number from URL (e.g., /series/back-to-spring/chapter-61 -> 61)
@@ -378,7 +378,7 @@ internal class Azoramoon(context: MangaLoaderContext) :
 				branch = null,
 				source = source,
 			)
-		}.reversed()
+		}.sortedBy { it.number }
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
